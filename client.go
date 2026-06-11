@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -40,7 +41,22 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			return nil, err
 		}
 		if stdioTransport, ok := mcpClient.GetTransport().(*transport.Stdio); ok {
-			go io.Copy(io.Discard, stdioTransport.Stderr())
+			if stderr := stdioTransport.Stderr(); stderr != nil {
+				go func() {
+					scanner := bufio.NewScanner(stderr)
+					for scanner.Scan() {
+						log.Printf("<%s:stderr> %s", name, scanner.Text())
+					}
+					if err := scanner.Err(); err != nil {
+						if errors.Is(err, bufio.ErrTooLong) {
+							log.Printf("<%s:stderr> line too long, falling back to discarding stderr", name)
+							_, _ = io.Copy(io.Discard, stderr)
+						} else {
+							log.Printf("<%s:stderr> error reading stderr: %v", name, err)
+						}
+					}
+				}()
+			}
 		}
 
 		return &Client{
