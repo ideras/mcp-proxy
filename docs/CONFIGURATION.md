@@ -92,3 +92,62 @@ Notes:
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
 
+## groups (aggregate / unify MCPs under one URL)
+
+Normally each `mcpServers` entry is published on its **own** sub-route
+(`<baseURL>/<name>/`). `groups` instead merges several entries into a **single**
+MCP endpoint so a client connects to one URL and sees the union of all member
+tools/prompts/resources.
+
+Members of a group are **not** exposed on their own standalone route — they are
+only reachable through the group route. A `mcpServers` entry may belong to at
+most one group.
+
+```jsonc
+{
+  "mcpProxy": { /* ...as above... */ },
+  "mcpServers": {
+    "github": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"] },
+    "fetch":  { "command": "uvx", "args": ["mcp-server-fetch"] }
+  },
+  "groups": {
+    "all": {
+      "servers": ["github", "fetch"],
+      "conflictMode": "prefix",
+      "options": { "authTokens": ["GroupToken"] }
+    }
+  }
+}
+```
+
+- **`servers`** (`[]string`, required, non-empty): the `mcpServers` keys to merge.
+- **`conflictMode`** (default `"prefix"`): what to do when two members expose
+  the same tool/prompt/resource:
+  - `"prefix"` — namespace every member's items with its own name
+    (`github.search`, `fetch.search`) so duplicates never collide. The proxy
+    transparently strips the prefix before calling the backend, so backends are
+    untouched.
+  - `"error"` — register names verbatim and **fail startup** on the first
+    duplicate. Use when you assert your members have no overlapping names and
+    want clean, unprefixed names.
+  - `"first-wins"` — register verbatim and keep whichever member registered a
+    name first, silently skipping later duplicates.
+- **`options`**: per-group `OptionsV2` (same shape as `mcpProxy.options`).
+  These defaults inherit from `mcpProxy.options` the same way per-server
+  options do, and the group's middlewares (recover / logging / auth) govern the
+  single merged route. Per-member `options.toolFilter` and `options.disabled`
+  still apply *before* tools are merged into the group.
+
+### Conflict-mode escaping
+
+Conflict handling applies to **tools** (by name), **prompts** (by name),
+**resources** (by URI), and **resource templates** (by URI template). In
+`"prefix"` mode:
+
+- tools & prompts become `<member>.<name>`;
+- resource URIs become `<member>/<uri>`;
+- resource-template patterns become `<member>/<template>`.
+
+The proxy restores the original name/URI before delegating to the backend,
+so member servers need no awareness of namespacing.
+

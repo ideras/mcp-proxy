@@ -1,18 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/yosida95/uritemplate/v3"
 )
 
 type Client struct {
@@ -21,6 +25,111 @@ type Client struct {
 	needManualStart bool
 	client          *client.Client
 	options         *OptionsV2
+
+	// Aggregate-mode fields. In standalone (per-route) mode `namespace` is empty,
+	// `registerMode` is empty and `registry` is nil, so the client registers
+	// every tool/prompt/resource verbatim (the original behavior). When the
+	// client is a member of a group, `registry` tracks names already claimed on
+	// the shared server, and `namespace`/`registerMode` decide how collisions
+	// are handled.
+	namespace    string
+	registerMode ConflictMode
+	registry     *nameRegistry
+}
+
+// nameRegistry remembers the keys (tool/prompt names, resource URIs, resource
+// template patterns) already registered on a shared MCPServer so that a group
+// can detect collisions between its member clients.
+type nameRegistry struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+func newNameRegistry() *nameRegistry {
+	return &nameRegistry{seen: make(map[string]struct{})}
+}
+
+// claim returns true when key was newly recorded. A false return means another
+// member already registered an item under the same key (a collision).
+func (r *nameRegistry) claim(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.seen[key]; ok {
+		return false
+	}
+	r.seen[key] = struct{}{}
+	return true
+}
+
+// collisionError marks a duplicate name encountered while ConflictMode is
+// "error". Such errors are treated as fatal configuration errors regardless
+// of PanicIfInvalid.
+type collisionError struct {
+	kind string
+	name string
+}
+
+func (e *collisionError) Error() string {
+	return fmt.Sprintf("conflict on %s %q in error conflict mode (use \"prefix\" or \"first-wins\" to resolve)", e.kind, e.name)
+}
+
+// configureAggregate switches a client into aggregate (grouped) mode. `prefix`
+// is the client's group namespace name (its mcpServers key); it is only used
+// to namespace names when mode is ConflictModePrefix.
+func (c *Client) configureAggregate(namespace string, mode ConflictMode, registry *nameRegistry) {
+	c.namespace = namespace
+	c.registerMode = mode
+	c.registry = registry
+}
+
+// namespaceActive reports whether this client should namespace the items it
+// registers (true only in prefix mode).
+func (c *Client) namespaceActive() bool {
+	return c.registerMode == ConflictModePrefix && c.namespace != ""
+}
+
+// applyName returns the registered name for a tool/prompt given the conflict
+// mode. In prefix mode the client name is dotted in front of the original name.
+func (c *Client) applyName(name string) string {
+	if c.namespaceActive() {
+		return c.namespace + "-" + name
+	}
+	return name
+}
+
+// applyURI returns the registered URI for a resource/template. In prefix mode
+// the client name is prepended as a virtual path segment.
+func (c *Client) applyURI(uri string) string {
+	if c.namespaceActive() {
+		return c.namespace + "/" + uri
+	}
+	return uri
+}
+
+// resourceConflict checks `kind`/`name` against the shared registry and applies
+// the configured conflict policy. It returns true when the item may be
+// registered, and false when it must be skipped. An error (collisionError) is
+// returned for fatal duplicates under ConflictModeError.
+func (c *Client) resourceConflict(kind, name string) (bool, error) {
+	if c.registry == nil {
+		return true, nil // standalone mode never tracks collisions
+	}
+	key := name
+	if kind == "tool" || kind == "prompt" {
+		key = c.applyName(name)
+	} else {
+		key = c.applyURI(name)
+	}
+	if c.registry.claim(key) {
+		return true, nil
+	}
+	switch c.registerMode {
+	case ConflictModeError:
+		return false, &collisionError{kind: kind, name: name}
+	default: // ConflictModePrefix (reuse of own name) and ConflictModeFirstWins
+		log.Printf("<%s> Skipping duplicate %s %q (conflict mode: %s)", c.name, kind, name, c.registerMode)
+		return false, nil
+	}
 }
 
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
@@ -37,6 +146,24 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		mcpClient, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
 		if err != nil {
 			return nil, err
+		}
+		if stdioTransport, ok := mcpClient.GetTransport().(*transport.Stdio); ok {
+			if stderr := stdioTransport.Stderr(); stderr != nil {
+				go func() {
+					scanner := bufio.NewScanner(stderr)
+					for scanner.Scan() {
+						log.Printf("<%s:stderr> %s", name, scanner.Text())
+					}
+					if err := scanner.Err(); err != nil {
+						if errors.Is(err, bufio.ErrTooLong) {
+							log.Printf("<%s:stderr> line too long, falling back to discarding stderr", name)
+							_, _ = io.Copy(io.Discard, stderr)
+						} else {
+							log.Printf("<%s:stderr> error reading stderr: %v", name, err)
+						}
+					}
+				}()
+			}
 		}
 
 		return &Client{
@@ -108,9 +235,25 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	if err != nil {
 		return err
 	}
-	_ = c.addPromptsToServer(ctx, mcpServer)
-	_ = c.addResourcesToServer(ctx, mcpServer)
-	_ = c.addResourceTemplatesToServer(ctx, mcpServer)
+	// Prompt/resource/template listing is best-effort: many backends do not
+	// support one or more of these capabilities and report “method not found”.
+	// We deliberately ignore those listing errors in both standalone and
+	// aggregate modes (matching the original behavior), with one exception: a
+	// collisionError raised by ConflictModeError is a real config bug and must
+	// always surface so startup fails.
+	for _, addErr := range []error{
+		c.addPromptsToServer(ctx, mcpServer),
+		c.addResourcesToServer(ctx, mcpServer),
+		c.addResourceTemplatesToServer(ctx, mcpServer),
+	} {
+		if addErr == nil {
+			continue
+		}
+		var ce *collisionError
+		if errors.As(addErr, &ce) {
+			return addErr
+		}
+	}
 
 	if c.needPing {
 		go c.startPingTask(ctx)
@@ -191,10 +334,27 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		}
 		log.Printf("<%s> Successfully listed %d tools", c.name, len(tools.Tools))
 		for _, tool := range tools.Tools {
-			if filterFunc(tool.Name) {
-				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
-				mcpServer.AddTool(tool, c.client.CallTool)
+			if !filterFunc(tool.Name) {
+				continue
 			}
+			ok, err := c.resourceConflict("tool", tool.Name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			originalName := tool.Name
+			tool.Name = c.applyName(originalName)
+			handler := c.client.CallTool
+			if c.namespaceActive() {
+				handler = func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					req.Params.Name = originalName
+					return c.client.CallTool(ctx, req)
+				}
+			}
+			log.Printf("<%s> Adding tool %s", c.name, tool.Name)
+			mcpServer.AddTool(tool, handler)
 		}
 		if tools.NextCursor == "" {
 			break
@@ -220,8 +380,24 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		}
 		log.Printf("<%s> Successfully listed %d prompts", c.name, len(prompts.Prompts))
 		for _, prompt := range prompts.Prompts {
+			ok, err := c.resourceConflict("prompt", prompt.Name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			originalName := prompt.Name
+			prompt.Name = c.applyName(originalName)
+			handler := c.client.GetPrompt
+			if c.namespaceActive() {
+				handler = func(ctx context.Context, req mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					req.Params.Name = originalName
+					return c.client.GetPrompt(ctx, req)
+				}
+			}
 			log.Printf("<%s> Adding prompt %s", c.name, prompt.Name)
-			mcpServer.AddPrompt(prompt, c.client.GetPrompt)
+			mcpServer.AddPrompt(prompt, handler)
 		}
 		if prompts.NextCursor == "" {
 			break
@@ -246,14 +422,25 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		}
 		log.Printf("<%s> Successfully listed %d resources", c.name, len(resources.Resources))
 		for _, resource := range resources.Resources {
-			log.Printf("<%s> Adding resource %s", c.name, resource.Name)
-			mcpServer.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			ok, err := c.resourceConflict("resource", resource.URI)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			originalURI := resource.URI
+			resource.URI = c.applyURI(originalURI)
+			readHandler := func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				request.Params.URI = originalURI
 				readResource, e := c.client.ReadResource(ctx, request)
 				if e != nil {
 					return nil, e
 				}
 				return readResource.Contents, nil
-			})
+			}
+			log.Printf("<%s> Adding resource %s", c.name, resource.Name)
+			mcpServer.AddResource(resource, readHandler)
 		}
 		if resources.NextCursor == "" {
 			break
@@ -276,14 +463,43 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 		}
 		log.Printf("<%s> Successfully listed %d resource templates", c.name, len(resourceTemplates.ResourceTemplates))
 		for _, resourceTemplate := range resourceTemplates.ResourceTemplates {
-			log.Printf("<%s> Adding resource template %s", c.name, resourceTemplate.Name)
-			mcpServer.AddResourceTemplate(resourceTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			if resourceTemplate.URITemplate == nil {
+				log.Printf("<%s> Skipping resource template with nil URITemplate", c.name)
+				continue
+			}
+			originalRaw := resourceTemplate.URITemplate.Raw()
+			ok, err := c.resourceConflict("resource-template", originalRaw)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			regTemplate := resourceTemplate
+			stripPrefix := ""
+			if c.namespaceActive() {
+				stripPrefix = c.namespace + "/"
+				appliedRaw := c.applyURI(originalRaw)
+				ut, utErr := uritemplate.New(appliedRaw)
+				if utErr != nil {
+					log.Printf("<%s> Could not namespace resource template %q: %v (registering verbatim)", c.name, originalRaw, utErr)
+					stripPrefix = ""
+				} else {
+					regTemplate.URITemplate = &mcp.URITemplate{Template: ut}
+				}
+			}
+			readHandler := func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+				if stripPrefix != "" && strings.HasPrefix(request.Params.URI, stripPrefix) {
+					request.Params.URI = request.Params.URI[len(stripPrefix):]
+				}
 				readResource, e := c.client.ReadResource(ctx, request)
 				if e != nil {
 					return nil, e
 				}
 				return readResource.Contents, nil
-			})
+			}
+			log.Printf("<%s> Adding resource template %s", c.name, regTemplate.Name)
+			mcpServer.AddResourceTemplate(regTemplate, readHandler)
 		}
 		if resourceTemplates.NextCursor == "" {
 			break
@@ -306,13 +522,16 @@ type Server struct {
 	handler   http.Handler
 }
 
-func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCPClientConfigV2) (*Server, error) {
+func newMCPServer(name string, serverConfig *MCPProxyConfigV2, opts *OptionsV2) (*Server, error) {
+	if opts == nil {
+		opts = &OptionsV2{}
+	}
 	serverOpts := []server.ServerOption{
 		server.WithResourceCapabilities(true, true),
 		server.WithRecovery(),
 	}
 
-	if clientConfig.Options.LogEnabled.OrElse(false) {
+	if opts.LogEnabled.OrElse(false) {
 		serverOpts = append(serverOpts, server.WithLogging())
 	}
 	mcpServer := server.NewMCPServer(
@@ -343,8 +562,8 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		handler:   handler,
 	}
 
-	if clientConfig.Options != nil && len(clientConfig.Options.AuthTokens) > 0 {
-		srv.tokens = clientConfig.Options.AuthTokens
+	if len(opts.AuthTokens) > 0 {
+		srv.tokens = opts.AuthTokens
 	}
 
 	return srv, nil
