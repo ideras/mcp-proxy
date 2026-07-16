@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/tbxark/mcp-proxy/internal/config"
 )
 
 // backendMCP builds an in-process MCP server that exposes a single tool named
@@ -48,14 +50,14 @@ func TestAggregatePrefixNamespacesAndDispatches(t *testing.T) {
 	registry := newNameRegistry()
 	info := mcp.Implementation{Name: "proxy-test"}
 
-	alpha := &Client{name: "alpha", client: alphaClient, options: &OptionsV2{}}
-	alpha.configureAggregate("alpha", ConflictModePrefix, registry)
+	alpha := &Client{name: "alpha", client: alphaClient, options: &config.OptionsV2{}}
+	alpha.configureAggregate("alpha", config.ConflictModePrefix, registry)
 	if err := alpha.addToMCPServer(context.Background(), info, merged); err != nil {
 		t.Fatalf("alpha addToMCPServer: %v", err)
 	}
 
-	beta := &Client{name: "beta", client: betaClient, options: &OptionsV2{}}
-	beta.configureAggregate("beta", ConflictModePrefix, registry)
+	beta := &Client{name: "beta", client: betaClient, options: &config.OptionsV2{}}
+	beta.configureAggregate("beta", config.ConflictModePrefix, registry)
 	if err := beta.addToMCPServer(context.Background(), info, merged); err != nil {
 		t.Fatalf("beta addToMCPServer: %v", err)
 	}
@@ -135,14 +137,14 @@ func TestAggregateErrorModeFailsOnCollision(t *testing.T) {
 	registry := newNameRegistry()
 	info := mcp.Implementation{Name: "proxy-test"}
 
-	alpha := &Client{name: "alpha", client: alphaClient, options: &OptionsV2{}}
-	alpha.configureAggregate("alpha", ConflictModeError, registry)
+	alpha := &Client{name: "alpha", client: alphaClient, options: &config.OptionsV2{}}
+	alpha.configureAggregate("alpha", config.ConflictModeError, registry)
 	if err := alpha.addToMCPServer(context.Background(), info, merged); err != nil {
 		t.Fatalf("alpha addToMCPServer: %v", err)
 	}
 
-	beta := &Client{name: "beta", client: betaClient, options: &OptionsV2{}}
-	beta.configureAggregate("beta", ConflictModeError, registry)
+	beta := &Client{name: "beta", client: betaClient, options: &config.OptionsV2{}}
+	beta.configureAggregate("beta", config.ConflictModeError, registry)
 	err := beta.addToMCPServer(context.Background(), info, merged)
 	if err == nil {
 		t.Fatal("beta should have failed to register a duplicate \"search\" tool in error mode")
@@ -158,7 +160,7 @@ func TestStandaloneRegistersVerbatim(t *testing.T) {
 	merged := server.NewMCPServer("merged", "1.0.0", server.WithResourceCapabilities(true, true))
 	info := mcp.Implementation{Name: "proxy-test"}
 
-	standalone := &Client{name: "alpha", client: backendClient, options: &OptionsV2{}}
+	standalone := &Client{name: "alpha", client: backendClient, options: &config.OptionsV2{}}
 	// no configureAggregate -> standalone mode (registry nil, namespace "")
 	if err := standalone.addToMCPServer(context.Background(), info, merged); err != nil {
 		t.Fatalf("addToMCPServer: %v", err)

@@ -1,11 +1,13 @@
-package main
+package proxy
 
 import (
 	"errors"
 	"testing"
+
+	"github.com/tbxark/mcp-proxy/internal/config"
 )
 
-func newTestClient(name string, mode ConflictMode, namespace string, registry *nameRegistry) *Client {
+func newTestClient(name string, mode config.ConflictMode, namespace string, registry *nameRegistry) *Client {
 	return &Client{
 		name:         name,
 		registry:     registry,
@@ -29,7 +31,7 @@ func TestNameRegistryClaim(t *testing.T) {
 
 func TestApplyNameAndURI(t *testing.T) {
 	// standalone: no namespace applied
-	standalone := &Client{namespace: "", registerMode: ConflictModePrefix}
+	standalone := &Client{namespace: "", registerMode: config.ConflictModePrefix}
 	if got := standalone.applyName("search"); got != "search" {
 		t.Fatalf("standalone applyName = %q, want %q", got, "search")
 	}
@@ -38,7 +40,7 @@ func TestApplyNameAndURI(t *testing.T) {
 	}
 
 	// prefix mode: names dotted, URIs slash-prefixed
-	prefixed := &Client{namespace: "github", registerMode: ConflictModePrefix}
+	prefixed := &Client{namespace: "github", registerMode: config.ConflictModePrefix}
 	if got := prefixed.applyName("search"); got != "github-search" {
 		t.Fatalf("prefix applyName = %q, want %q", got, "github-search")
 	}
@@ -47,7 +49,7 @@ func TestApplyNameAndURI(t *testing.T) {
 	}
 
 	// error / first-wins modes never namespace, even with a namespace set
-	errored := &Client{namespace: "github", registerMode: ConflictModeError}
+	errored := &Client{namespace: "github", registerMode: config.ConflictModeError}
 	if got := errored.applyName("search"); got != "search" {
 		t.Fatalf("error applyName = %q, want %q (no namespacing)", got, "search")
 	}
@@ -58,14 +60,14 @@ func TestApplyNameAndURI(t *testing.T) {
 
 func TestNamespaceActive(t *testing.T) {
 	cases := []struct {
-		mode ConflictMode
+		mode config.ConflictMode
 		ns   string
 		want bool
 	}{
-		{ConflictModePrefix, "github", true},
-		{ConflictModePrefix, "", false}, // no namespace -> not active
-		{ConflictModeError, "github", false},
-		{ConflictModeFirstWins, "github", false},
+		{config.ConflictModePrefix, "github", true},
+		{config.ConflictModePrefix, "", false}, // no namespace -> not active
+		{config.ConflictModeError, "github", false},
+		{config.ConflictModeFirstWins, "github", false},
 		{"", "", false},
 	}
 	for _, tc := range cases {
@@ -80,8 +82,8 @@ func TestResourceConflictPrefixNoCollision(t *testing.T) {
 	// Two members with the same tool name under prefix mode must both register:
 	// their namespaced keys differ.
 	reg := newNameRegistry()
-	a := newTestClient("alpha", ConflictModePrefix, "alpha", reg)
-	b := newTestClient("beta", ConflictModePrefix, "beta", reg)
+	a := newTestClient("alpha", config.ConflictModePrefix, "alpha", reg)
+	b := newTestClient("beta", config.ConflictModePrefix, "beta", reg)
 
 	if ok, err := a.resourceConflict("tool", "search"); !ok || err != nil {
 		t.Fatalf("alpha first tool: ok=%v err=%v", ok, err)
@@ -93,8 +95,8 @@ func TestResourceConflictPrefixNoCollision(t *testing.T) {
 
 func TestResourceConflictErrorModeFatal(t *testing.T) {
 	reg := newNameRegistry()
-	a := newTestClient("alpha", ConflictModeError, "alpha", reg)
-	b := newTestClient("beta", ConflictModeError, "beta", reg)
+	a := newTestClient("alpha", config.ConflictModeError, "alpha", reg)
+	b := newTestClient("beta", config.ConflictModeError, "beta", reg)
 
 	if ok, err := a.resourceConflict("tool", "search"); !ok || err != nil {
 		t.Fatalf("alpha first tool: ok=%v err=%v", ok, err)
@@ -114,8 +116,8 @@ func TestResourceConflictErrorModeFatal(t *testing.T) {
 
 func TestResourceConflictFirstWinsSkips(t *testing.T) {
 	reg := newNameRegistry()
-	a := newTestClient("alpha", ConflictModeFirstWins, "alpha", reg)
-	b := newTestClient("beta", ConflictModeFirstWins, "beta", reg)
+	a := newTestClient("alpha", config.ConflictModeFirstWins, "alpha", reg)
+	b := newTestClient("beta", config.ConflictModeFirstWins, "beta", reg)
 
 	if ok, err := a.resourceConflict("prompt", "review"); !ok || err != nil {
 		t.Fatalf("alpha first prompt: ok=%v err=%v", ok, err)
@@ -128,7 +130,7 @@ func TestResourceConflictFirstWinsSkips(t *testing.T) {
 func TestResourceConflictStandaloneNeverTracks(t *testing.T) {
 	// registry == nil means standalone mode: always allow, never track.
 	standalone := &Client{} // registry nil
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if ok, err := standalone.resourceConflict("tool", "dup"); !ok || err != nil {
 			t.Fatalf("standalone iteration %d should always allow: ok=%v err=%v", i, ok, err)
 		}
