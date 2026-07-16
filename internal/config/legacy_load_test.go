@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -34,7 +34,7 @@ func TestLoadAcceptsGroupsConfig(t *testing.T) {
 			"all": { "servers": ["github", "fetch"], "conflictMode": "error" }
 		}
 	}`)
-	cfg, err := load(p, false, false, "", 10)
+	cfg, err := Load(p, false, false, "", 10)
 	if err != nil {
 		t.Fatalf("load with groups failed: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestLoadStillAcceptsConfigWithoutGroups(t *testing.T) {
 			"fetch": { "command": "uvx", "args": ["mcp-server-fetch"] }
 		}
 	}`)
-	cfg, err := load(p, false, false, "", 10)
+	cfg, err := Load(p, false, false, "", 10)
 	if err != nil {
 		t.Fatalf("load without groups failed: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestLoadRejectsInvalidGroup(t *testing.T) {
 			"all": { "servers": ["github", "nope"] }
 		}
 	}`)
-	if _, err := load(p, false, false, "", 10); err == nil {
+	if _, err := Load(p, false, false, "", 10); err == nil {
 		t.Fatal("load should reject group referencing unknown server")
 	}
 }

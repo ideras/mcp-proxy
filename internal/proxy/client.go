@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"bufio"
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/yosida95/uritemplate/v3"
+
+	"github.com/tbxark/mcp-proxy/internal/config"
 )
 
 type Client struct {
@@ -24,7 +25,7 @@ type Client struct {
 	needPing        bool
 	needManualStart bool
 	client          *client.Client
-	options         *OptionsV2
+	options         *config.OptionsV2
 
 	// Aggregate-mode fields. In standalone (per-route) mode `namespace` is empty,
 	// `registerMode` is empty and `registry` is nil, so the client registers
@@ -33,7 +34,7 @@ type Client struct {
 	// the shared server, and `namespace`/`registerMode` decide how collisions
 	// are handled.
 	namespace    string
-	registerMode ConflictMode
+	registerMode config.ConflictMode
 	registry     *nameRegistry
 }
 
@@ -76,7 +77,7 @@ func (e *collisionError) Error() string {
 // configureAggregate switches a client into aggregate (grouped) mode. `prefix`
 // is the client's group namespace name (its mcpServers key); it is only used
 // to namespace names when mode is ConflictModePrefix.
-func (c *Client) configureAggregate(namespace string, mode ConflictMode, registry *nameRegistry) {
+func (c *Client) configureAggregate(namespace string, mode config.ConflictMode, registry *nameRegistry) {
 	c.namespace = namespace
 	c.registerMode = mode
 	c.registry = registry
@@ -85,7 +86,7 @@ func (c *Client) configureAggregate(namespace string, mode ConflictMode, registr
 // namespaceActive reports whether this client should namespace the items it
 // registers (true only in prefix mode).
 func (c *Client) namespaceActive() bool {
-	return c.registerMode == ConflictModePrefix && c.namespace != ""
+	return c.registerMode == config.ConflictModePrefix && c.namespace != ""
 }
 
 // applyName returns the registered name for a tool/prompt given the conflict
@@ -114,7 +115,7 @@ func (c *Client) resourceConflict(kind, name string) (bool, error) {
 	if c.registry == nil {
 		return true, nil // standalone mode never tracks collisions
 	}
-	key := name
+	var key string
 	if kind == "tool" || kind == "prompt" {
 		key = c.applyName(name)
 	} else {
@@ -124,7 +125,7 @@ func (c *Client) resourceConflict(kind, name string) (bool, error) {
 		return true, nil
 	}
 	switch c.registerMode {
-	case ConflictModeError:
+	case config.ConflictModeError:
 		return false, &collisionError{kind: kind, name: name}
 	default: // ConflictModePrefix (reuse of own name) and ConflictModeFirstWins
 		log.Printf("<%s> Skipping duplicate %s %q (conflict mode: %s)", c.name, kind, name, c.registerMode)
@@ -132,13 +133,13 @@ func (c *Client) resourceConflict(kind, name string) (bool, error) {
 	}
 }
 
-func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
-	clientInfo, pErr := parseMCPClientConfigV2(conf)
+func newMCPClient(name string, conf *config.MCPClientConfigV2) (*Client, error) {
+	clientInfo, pErr := config.ParseMCPClientConfigV2(conf)
 	if pErr != nil {
 		return nil, pErr
 	}
 	switch v := clientInfo.(type) {
-	case *StdioMCPClientConfig:
+	case *config.StdioMCPClientConfig:
 		envs := make([]string, 0, len(v.Env))
 		for kk, vv := range v.Env {
 			envs = append(envs, fmt.Sprintf("%s=%s", kk, vv))
@@ -171,7 +172,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			client:  mcpClient,
 			options: conf.Options,
 		}, nil
-	case *SSEMCPClientConfig:
+	case *config.SSEMCPClientConfig:
 		var options []transport.ClientOption
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
@@ -187,7 +188,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			client:          mcpClient,
 			options:         conf.Options,
 		}, nil
-	case *StreamableMCPClientConfig:
+	case *config.StreamableMCPClientConfig:
 		var options []transport.StreamableHTTPCOption
 		if len(v.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(v.Headers))
@@ -295,12 +296,12 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 
 	if c.options != nil && c.options.ToolFilter != nil && len(c.options.ToolFilter.List) > 0 {
 		filterSet := make(map[string]struct{})
-		mode := ToolFilterMode(strings.ToLower(string(c.options.ToolFilter.Mode)))
+		mode := config.ToolFilterMode(strings.ToLower(string(c.options.ToolFilter.Mode)))
 		for _, toolName := range c.options.ToolFilter.List {
 			filterSet[toolName] = struct{}{}
 		}
 		switch mode {
-		case ToolFilterModeAllow:
+		case config.ToolFilterModeAllow:
 			filterFunc = func(toolName string) bool {
 				_, inList := filterSet[toolName]
 				if !inList {
@@ -308,7 +309,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 				}
 				return inList
 			}
-		case ToolFilterModeBlock:
+		case config.ToolFilterModeBlock:
 			filterFunc = func(toolName string) bool {
 				_, inList := filterSet[toolName]
 				if inList {
@@ -514,57 +515,4 @@ func (c *Client) Close() error {
 		return c.client.Close()
 	}
 	return nil
-}
-
-type Server struct {
-	tokens    []string
-	mcpServer *server.MCPServer
-	handler   http.Handler
-}
-
-func newMCPServer(name string, serverConfig *MCPProxyConfigV2, opts *OptionsV2) (*Server, error) {
-	if opts == nil {
-		opts = &OptionsV2{}
-	}
-	serverOpts := []server.ServerOption{
-		server.WithResourceCapabilities(true, true),
-		server.WithRecovery(),
-	}
-
-	if opts.LogEnabled.OrElse(false) {
-		serverOpts = append(serverOpts, server.WithLogging())
-	}
-	mcpServer := server.NewMCPServer(
-		name,
-		serverConfig.Version,
-		serverOpts...,
-	)
-
-	var handler http.Handler
-
-	switch serverConfig.Type {
-	case MCPServerTypeSSE:
-		handler = server.NewSSEServer(
-			mcpServer,
-			server.WithStaticBasePath(name),
-			server.WithBaseURL(serverConfig.BaseURL),
-		)
-	case MCPServerTypeStreamable:
-		handler = server.NewStreamableHTTPServer(
-			mcpServer,
-			server.WithStateLess(true),
-		)
-	default:
-		return nil, fmt.Errorf("unknown server type: %s", serverConfig.Type)
-	}
-	srv := &Server{
-		mcpServer: mcpServer,
-		handler:   handler,
-	}
-
-	if len(opts.AuthTokens) > 0 {
-		srv.tokens = opts.AuthTokens
-	}
-
-	return srv, nil
 }

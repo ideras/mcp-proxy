@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"crypto/tls"
@@ -122,7 +122,9 @@ type MCPClientConfigV2 struct {
 	Options *OptionsV2 `json:"options,omitempty"`
 }
 
-func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
+// ParseMCPClientConfigV2 resolves a raw V2 client config entry into its
+// concrete transport config (Stdio, SSE, or Streamable HTTP).
+func ParseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 	if conf.Command != "" || conf.TransportType == MCPClientTypeStdio {
 		if conf.Command == "" {
 			return nil, errors.New("command is required for stdio transport")
@@ -214,7 +216,9 @@ func newConfProvider(path string, insecure, expandEnv bool, httpHeaders string, 
 	return nil, errors.New("unsupported config path")
 }
 
-func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) (*Config, error) {
+// Load reads and validates the proxy configuration from a local path or
+// remote URL, applying V1-to-V2 migration and group/option defaulting.
+func Load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) (*Config, error) {
 	pro, err := newConfProvider(path, insecure, expandEnv, httpHeaders, httpTimeout)
 	if err != nil {
 		return nil, err

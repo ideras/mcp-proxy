@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -15,6 +15,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/tbxark/mcp-proxy/internal/config"
 )
 
 type MiddlewareFunc func(http.Handler) http.Handler
@@ -73,8 +75,10 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 	}
 }
 
-func startHTTPServer(config *Config) error {
-	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
+// Start builds every configured MCP client/group, mounts them on an HTTP mux,
+// and runs the proxy's HTTP server until a shutdown signal is received.
+func Start(cfg *config.Config) error {
+	baseURL, uErr := url.Parse(cfg.McpProxy.BaseURL)
 	if uErr != nil {
 		return uErr
 	}
@@ -85,24 +89,23 @@ func startHTTPServer(config *Config) error {
 	var errorGroup errgroup.Group
 	httpMux := http.NewServeMux()
 	httpServer := &http.Server{
-		Addr:    config.McpProxy.Addr,
+		Addr:    cfg.McpProxy.Addr,
 		Handler: httpMux,
 	}
 	info := mcp.Implementation{
-		Name: config.McpProxy.Name,
+		Name: cfg.McpProxy.Name,
 	}
 
 	// Build the set of clients that belong to a group; those are published
 	// only through their group route, never on a standalone route.
 	grouped := make(map[string]struct{})
-	for _, group := range config.Groups {
+	for _, group := range cfg.Groups {
 		for _, sname := range group.Servers {
 			grouped[sname] = struct{}{}
 		}
 	}
 
-	for name, clientConfig := range config.McpServers {
-		name, clientConfig := name, clientConfig
+	for name, clientConfig := range cfg.McpServers {
 		if _, ok := grouped[name]; ok {
 			continue
 		}
@@ -114,7 +117,7 @@ func startHTTPServer(config *Config) error {
 		if err != nil {
 			return err
 		}
-		mcpServer, err := newMCPServer(name, config.McpProxy, clientConfig.Options)
+		mcpServer, err := newMCPServer(name, cfg.McpProxy, clientConfig.Options)
 		if err != nil {
 			return err
 		}
@@ -138,10 +141,9 @@ func startHTTPServer(config *Config) error {
 		})
 	}
 
-	for gname, group := range config.Groups {
-		gname, group := gname, group
+	for gname, group := range cfg.Groups {
 		errorGroup.Go(func() error {
-			return registerGroup(ctx, httpMux, httpServer, baseURL, info, config, gname, group)
+			return registerGroup(ctx, httpMux, httpServer, baseURL, info, cfg, gname, group)
 		})
 	}
 
@@ -154,8 +156,8 @@ func startHTTPServer(config *Config) error {
 	}()
 
 	go func() {
-		log.Printf("Starting %s server", config.McpProxy.Type)
-		log.Printf("%s server listening on %s", config.McpProxy.Type, config.McpProxy.Addr)
+		log.Printf("Starting %s server", cfg.McpProxy.Type)
+		log.Printf("%s server listening on %s", cfg.McpProxy.Type, cfg.McpProxy.Addr)
 		hErr := httpServer.ListenAndServe()
 		if hErr != nil && !errors.Is(hErr, http.ErrServerClosed) {
 			log.Fatalf("Failed to start server: %v", hErr)
@@ -180,7 +182,7 @@ func startHTTPServer(config *Config) error {
 
 // buildMiddlewares assembles the per-route middleware stack for a standalone
 // client or a group from its effective options.
-func buildMiddlewares(prefix string, opts *OptionsV2) []MiddlewareFunc {
+func buildMiddlewares(prefix string, opts *config.OptionsV2) []MiddlewareFunc {
 	mw := []MiddlewareFunc{recoverMiddleware(prefix)}
 	if opts != nil && opts.LogEnabled.OrElse(false) {
 		mw = append(mw, loggerMiddleware(prefix))
@@ -216,18 +218,18 @@ func registerGroup(
 	httpServer *http.Server,
 	baseURL *url.URL,
 	info mcp.Implementation,
-	config *Config,
+	cfg *config.Config,
 	gname string,
-	group *GroupConfig,
+	group *config.GroupConfig,
 ) error {
-	srv, err := newMCPServer(gname, config.McpProxy, group.Options)
+	srv, err := newMCPServer(gname, cfg.McpProxy, group.Options)
 	if err != nil {
 		return err
 	}
 	registry := newNameRegistry()
 	var members []*Client
 	for _, sname := range group.Servers {
-		clientConfig := config.McpServers[sname]
+		clientConfig := cfg.McpServers[sname]
 		if clientConfig.Options.Disabled {
 			log.Printf("<%s/%s> Disabled", gname, sname)
 			continue

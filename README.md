@@ -29,7 +29,7 @@ make build
 ### Install via Go
 
 ```bash
-go install github.com/tbxark/mcp-proxy@latest
+go install github.com/tbxark/mcp-proxy/cmd/mcp-proxy@latest
 ```
 
 ### Docker

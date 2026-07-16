@@ -4,6 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+
+	"github.com/tbxark/mcp-proxy/internal/config"
+	"github.com/tbxark/mcp-proxy/internal/proxy"
 )
 
 var BuildVersion = "dev"
@@ -26,11 +29,11 @@ func main() {
 		fmt.Println(BuildVersion)
 		return
 	}
-	config, err := load(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout)
+	cfg, err := config.Load(*conf, *insecure, *expandEnv, *httpHeaders, *httpTimeout)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	err = startHTTPServer(config)
+	err = proxy.Start(cfg)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
