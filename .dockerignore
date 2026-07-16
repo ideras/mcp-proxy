@@ -4,6 +4,6 @@ build
 docs
 .gitattributes
 .golangci.yml
-/config.json
-/docker-compose.yaml
+/configs
+/docker
 /README.md
